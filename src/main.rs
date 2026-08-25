@@ -5,6 +5,10 @@
 use rootle_gitlab::{Handler, api, respond};
 
 fn main() {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("rootle-gitlab {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let mut instance = api::DEFAULT_INSTANCE.to_string();
     let mut token_env = api::DEFAULT_TOKEN_ENV.to_string();
     let mut cache_base: Option<std::path::PathBuf> = None;
