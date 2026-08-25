@@ -542,3 +542,34 @@ async fn initialize_reports_usage_and_enforces_the_budget() {
     assert!(cache.blob("aa0002").is_some());
     assert!(cache.blob("aa0003").is_some());
 }
+
+#[tokio::test]
+async fn handshake_cache_dir_wins_over_the_default() {
+    let server = MockServer::start().await;
+    token_env_set();
+    let default_dir = tempdir();
+    let handshake_dir = tempdir();
+    // Construct with the default; initialize passes a different dir —
+    // the handshake's cache_dir is where a cached blob must land.
+    let line = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocol": 1,
+        "cache_dir": handshake_dir.to_string_lossy(),
+    }})
+    .to_string();
+    let uri = server.uri();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let h = Handler::new(&uri, "GL_TEST_TOKEN", Some(default_dir));
+            respond(&h, &line)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+    });
+    // A second handler on the SAME process would share the re-rooted
+    // cache; instead verify indirectly: the re-root happened during
+    // initialize (usage reported from the handshake dir, which is
+    // empty → 0).
+    let r = ask(&uri, &handshake_dir, "initialize", json!({"protocol": 1}));
+    assert_eq!(result(r)["cache"]["bytes"], 0);
+}

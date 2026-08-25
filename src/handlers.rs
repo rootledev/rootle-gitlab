@@ -8,7 +8,12 @@ use serde_json::{Value, json};
 
 pub struct Handler {
     pub gl: GitLab,
-    pub cache: Cache,
+    /// Rooted at the handshake's cache_dir when rootle passes one
+    /// (the documented contract); otherwise the XDG default. Interior
+    /// mutability because initialize is the first message — &self
+    /// throughout.
+    pub cache: parking_lot::RwLock<Cache>,
+    token_env: String,
 }
 
 /// Wire error taxonomy (protocol v1.1): semantics ride in data.kind.
@@ -77,13 +82,26 @@ impl Handler {
     pub fn new(instance: &str, token_env: &str, cache_base: Option<std::path::PathBuf>) -> Self {
         Handler {
             gl: GitLab::new(instance, token_env),
-            cache: Cache::new(cache_base),
+            cache: parking_lot::RwLock::new(Cache::new(cache_base)),
+            token_env: token_env.to_string(),
         }
     }
 
     pub fn dispatch(&self, method: &str, params: &Value) -> WireResult {
         match method {
             "initialize" => {
+                // The handshake's cache_dir wins over the default —
+                // rootle owns the subtree naming (protocol v1.2) and
+                // respawns re-send it, so re-rooting is idempotent.
+                if let Some(dir) = params["cache_dir"].as_str()
+                    && let Ok(path) = std::path::PathBuf::try_from(dir.to_string())
+                {
+                    let mut cache = self.cache.write();
+                    if cache.root_as_str() != Some(path.to_string_lossy().as_ref()) {
+                        *cache = Cache::new(Some(path));
+                    }
+                }
+                let cache = self.cache.read();
                 // Advisory cache budget (protocol v1.2): evict our
                 // subtree past it and report current usage — one
                 // [cache] max_mb knob in :settings governs every
@@ -91,9 +109,9 @@ impl Handler {
                 // network-free (restart obligations).
                 let budget = params["cache_bytes"].as_u64().unwrap_or(0);
                 if budget > 0 {
-                    self.cache.enforce_budget(budget);
+                    cache.enforce_budget(budget);
                 }
-                let usage = self.cache.size_bytes();
+                let usage = cache.size_bytes();
                 Ok(json!({
                     "protocol": 1,
                     "name": "gitlab",
@@ -132,16 +150,17 @@ impl Handler {
     /// Project metadata through the cache; a 404 invalidates a stale
     /// entry once (repo moved/renamed) and retries fresh.
     fn project(&self, path: &str) -> ApiResult<crate::api::Project> {
-        if let Some(p) = self.cache.project(path) {
+        let cached = self.cache.read().project(path);
+        if let Some(p) = cached {
             return Ok(p);
         }
         match self.gl.project(path) {
             Ok(p) => {
-                self.cache.put_project(&p);
+                self.cache.read().put_project(&p);
                 Ok(p)
             }
             Err(ApiError::Api { status: 404, .. }) => {
-                self.cache.drop_project(path);
+                self.cache.read().drop_project(path);
                 self.gl.project(path)
             }
             Err(e) => Err(e),
@@ -198,7 +217,8 @@ impl Handler {
             Ok(h) => h,
             Err(e) => return Err(WireError::from_api(&e)),
         };
-        if let Some(cached) = self.cache.tree(&head)
+        let cached = self.cache.read().tree(&head);
+        if let Some(cached) = cached
             && let Ok(v) = serde_json::from_slice::<Value>(&cached)
         {
             return Ok(v);
@@ -234,12 +254,15 @@ impl Handler {
             "truncated": truncated,
             "branch": branch,
         });
-        self.cache.put_tree(&head, body.to_string().as_bytes());
+        self.cache
+            .read()
+            .put_tree(&head, body.to_string().as_bytes());
         Ok(body)
     }
 
     fn repo_blob(&self, repo: &str, sha: &str) -> WireResult {
-        if let Some(bytes) = self.cache.blob(sha) {
+        let cached = self.cache.read().blob(sha);
+        if let Some(bytes) = cached {
             return Ok(json!({ "bytes_b64": b64(&bytes) }));
         }
         let project = self.project(repo).map_err(|e| WireError::from_api(&e))?;
@@ -257,7 +280,7 @@ impl Handler {
                 retry_after_s: None,
             });
         }
-        self.cache.put_blob(sha, &bytes);
+        self.cache.read().put_blob(sha, &bytes);
         Ok(json!({ "bytes_b64": b64(&bytes) }))
     }
 
@@ -385,7 +408,7 @@ impl Handler {
 
     fn project_by_id(&self, id: u64) -> ApiResult<String> {
         let p: crate::api::Project = self.gl.get_json(&format!("/projects/{id}"), &[])?;
-        self.cache.put_project(&p);
+        self.cache.read().put_project(&p);
         Ok(p.path_with_namespace)
     }
 }

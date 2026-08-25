@@ -40,6 +40,10 @@ pub fn encode_component(s: &str) -> String {
 }
 
 impl Cache {
+    pub fn root_as_str(&self) -> Option<&str> {
+        self.root.as_ref().and_then(|p| p.to_str())
+    }
+
     /// `base` overrides the root (tests inject a tempdir); None when
     /// no home can be resolved — every op becomes a no-op miss.
     pub fn new(base: Option<PathBuf>) -> Self {
