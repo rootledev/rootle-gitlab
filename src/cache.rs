@@ -13,7 +13,6 @@
 
 use crate::api::Project;
 use serde::{Deserialize, Serialize};
-use std::io;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

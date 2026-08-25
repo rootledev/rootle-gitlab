@@ -13,7 +13,6 @@ pub struct Handler {
     /// mutability because initialize is the first message — &self
     /// throughout.
     pub cache: parking_lot::RwLock<Cache>,
-    token_env: String,
 }
 
 /// Wire error taxonomy (protocol v1.1): semantics ride in data.kind.
@@ -83,7 +82,6 @@ impl Handler {
         Handler {
             gl: GitLab::new(instance, token_env),
             cache: parking_lot::RwLock::new(Cache::new(cache_base)),
-            token_env: token_env.to_string(),
         }
     }
 
