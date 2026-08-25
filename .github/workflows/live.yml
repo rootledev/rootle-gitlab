@@ -35,39 +35,3 @@ jobs:
           grep -q '"name":"gitlab"' /tmp/replies.jsonl
           grep -q 'gitlab-runner' /tmp/replies.jsonl
           echo "protocol surface live: ok"
-
-      # The PTY leg runs rootle itself; generous timeouts — gitlab.com
-      # project search can take ~60s under load.
-      - name: PTY drive (rootle → adapter → gitlab.com)
-        env:
-          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-        run: |
-          set -e
-          mkdir -p /tmp/pty
-          cat > /tmp/pty/drive.py <<'PY'
-          import sys, tempfile
-          from pathlib import Path
-          sys.path.insert(0, "e2e-ext")
-          from tui import Tui
-
-          tmp = Path(tempfile.mkdtemp())
-          config = tmp / "p.toml"
-          config.write_text(
-              '[provider]\nkind = "stdio"\n'
-              f'command = ["{sys.argv[1]}/rootle-gitlab"]\n'
-              'timeout_ms = 60000\n'
-          )
-          t = Tui(["/tmp/rootle-install/bin/rootle"], cols=110, rows=30,
-                  args=["--config", str(config)]).start()
-          try:
-              t.type_query("gitlab-runner")
-              t.key("ENTER")
-              t.expect("[repo]", timeout=120)
-              t.key("ENTER")
-              t.expect("results — ", timeout=10)  # any results header
-              t.expect(".gitignore", timeout=120)  # a tree landed
-              print("LIVE PTY: browse ok")
-          finally:
-              t.stop()
-          PY
-          echo "PTY leg runs in a follow-up; protocol leg above is the gate"
