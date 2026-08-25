@@ -1,0 +1,44 @@
+services:
+  # The gate: fmt + clippy -D warnings + the wiremock conformance
+  # suite, in the container (the host has no toolchain contract).
+  #   docker compose run --build --rm test
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    # The gate runs at image-build time (RUN steps); if the image
+    # exists, the gate passed. The command is just a confirmation.
+    command: 'echo "gate passed: fmt + clippy -D warnings + wiremock conformance"'
+
+  # Exports a versioned tarball + checksum to ./dist/ (VERSION
+  # required, TARGET overridable per matrix runner).
+  #   docker compose run --build --rm -e VERSION=0.1.0 release
+  # The tarball layout is the install contract:
+  #   rootle-gitlab-<VERSION>-<TARGET>.tar.gz containing <dir>/rootle-gitlab
+  release:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        VERSION="$${VERSION:?set VERSION to the release version, e.g. -e VERSION=0.1.0}"
+        # Package triple — the release matrix overrides it per runner;
+        # the build itself is native to the container.
+        TARGET="$${TARGET:-x86_64-unknown-linux-musl}"
+        PKG="rootle-gitlab-$$VERSION-$$TARGET"
+        cargo build --release --locked \
+        && strip target/release/rootle-gitlab \
+        && staging="$$(mktemp -d)" \
+        && mkdir -p "$$staging/$$PKG" \
+        && install -m755 target/release/rootle-gitlab "$$staging/$$PKG/rootle-gitlab" \
+        && tar -czf "/dist/$$PKG.tar.gz" -C "$$staging" "$$PKG" \
+        && cd /dist \
+        && sha256sum "$$PKG.tar.gz" > "$$PKG.tar.gz.sha256" \
+        && echo "released: /dist/$$PKG.tar.gz"
+    volumes:
+      - ./dist:/dist
