@@ -3,7 +3,7 @@
 //! The mock's URI is the adapter's --instance; tests drive the same
 //! `respond()` the binary's stdin loop uses.
 
-use rootle_gitlab::{Handler, respond};
+use rootle_gitlab::{Handler, cache::Cache, respond};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -507,4 +507,38 @@ async fn unknown_method_is_a_provider_error() {
 fn base64_decode(s: &str) -> Vec<u8> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+}
+
+#[tokio::test]
+async fn initialize_reports_usage_and_enforces_the_budget() {
+    let server = MockServer::start().await;
+    token_env_set();
+    let cache_dir = tempdir();
+    let cache = Cache::new(Some(cache_dir.clone()));
+    // 3 blobs: 1000 (oldest), 2000, 3000 bytes; budget 4500 → the
+    // oldest must go (LRU by mtime: 6000-1000=5000 > 4500), leaving
+    // 2000+3000 = 5000… still over → 2000 also goes. Use 5000: only
+    // the oldest leaves.
+    for (i, size) in [(1, 1000u64), (2, 2000), (3, 3000)] {
+        cache.put_blob(&format!("aa{:04}", i), &vec![0u8; size as usize]);
+        let p = cache_dir.join("blobs/aa").join(format!("aa{:04}", i));
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(100 - i);
+        let _ = filetime::set_file_mtime(&p, filetime::FileTime::from(t));
+    }
+    let r = ask(
+        &server.uri(),
+        &cache_dir,
+        "initialize",
+        json!({"protocol": 1, "cache_bytes": 5000, "cache_dir": cache_dir.to_string_lossy()}),
+    );
+    let res = result(r);
+    assert_eq!(res["name"], "gitlab");
+    assert_eq!(
+        res["cache"]["bytes"].as_u64().unwrap(),
+        5000,
+        "post-eviction usage reported"
+    );
+    assert!(cache.blob("aa0001").is_none(), "oldest blob evicted");
+    assert!(cache.blob("aa0002").is_some());
+    assert!(cache.blob("aa0003").is_some());
 }

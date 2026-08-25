@@ -155,8 +155,69 @@ impl Cache {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
+
+    // -- advisory budget (protocol v1.2) ----------------------------
+
+    /// Total bytes under the cache root (blobs + trees + metadata).
+    pub fn size_bytes(&self) -> u64 {
+        let Some(root) = &self.root else { return 0 };
+        let mut total = 0u64;
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        for f in files {
+            if let Ok(md) = std::fs::metadata(&f) {
+                total += md.len();
+            }
+        }
+        total
+    }
+
+    /// Evict least-recently-used BLOBS (mtime) until the subtree fits
+    /// the advisory budget. Blobs are the big, re-derivable payload;
+    /// trees are small and metadata tinier still. Nothing is deleted
+    /// when under budget. A cache read that cannot be satisfied is a
+    /// miss, not an error — every eviction feeds a future re-fetch.
+    pub fn enforce_budget(&self, budget_bytes: u64) {
+        let Some(root) = &self.root else { return };
+        let mut blobs = Vec::new();
+        walk(&root.join("blobs"), &mut blobs);
+        let total: u64 = blobs
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|md| md.len())
+            .sum();
+        if total <= budget_bytes {
+            return;
+        }
+        let mut sized: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = blobs
+            .into_iter()
+            .filter_map(|p| {
+                let md = std::fs::metadata(&p).ok()?;
+                Some((p, md.len(), md.modified().ok()?))
+            })
+            .collect();
+        sized.sort_by_key(|(_, _, mtime)| *mtime); // oldest first
+        let mut over = total - budget_bytes;
+        for (path, len, _) in sized {
+            if over == 0 {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                over = over.saturating_sub(len);
+            }
+        }
+    }
 }
 
-/// From the protocol: a cache read that cannot be satisfied is a
-/// miss, not an error — every `None` above feeds a re-fetch.
-pub fn _silence(_: io::Error) {}
+fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+}

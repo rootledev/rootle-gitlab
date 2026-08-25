@@ -83,14 +83,27 @@ impl Handler {
 
     pub fn dispatch(&self, method: &str, params: &Value) -> WireResult {
         match method {
-            "initialize" => Ok(json!({
-                "protocol": 1,
-                "name": "gitlab",
-                // Optimistic: startup does NO network (restart
-                // obligations). Unavailable search surfaces as honest
-                // per-call errors, not startup failure.
-                "capabilities": { "orgs": true, "code_search": true }
-            })),
+            "initialize" => {
+                // Advisory cache budget (protocol v1.2): evict our
+                // subtree past it and report current usage — one
+                // [cache] max_mb knob in :settings governs every
+                // backend. Local stat walk only; startup stays
+                // network-free (restart obligations).
+                let budget = params["cache_bytes"].as_u64().unwrap_or(0);
+                if budget > 0 {
+                    self.cache.enforce_budget(budget);
+                }
+                let usage = self.cache.size_bytes();
+                Ok(json!({
+                    "protocol": 1,
+                    "name": "gitlab",
+                    // Optimistic: startup does NO network (restart
+                    // obligations). Unavailable search surfaces as
+                    // honest per-call errors, not startup failure.
+                    "capabilities": { "orgs": true, "code_search": true },
+                    "cache": { "bytes": usage }
+                }))
+            }
             "search/repos" => self.search_repos(params["query"].as_str().unwrap_or("")),
             "org/repos" => self.org_repos(params["org"].as_str().unwrap_or("")),
             "repo/tree" => self.repo_tree(params["repo"].as_str().unwrap_or("")),
