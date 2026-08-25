@@ -92,7 +92,7 @@ impl Handler {
                 // rootle owns the subtree naming (protocol v1.2) and
                 // respawns re-send it, so re-rooting is idempotent.
                 if let Some(dir) = params["cache_dir"].as_str()
-                    && let Ok(path) = std::path::PathBuf::try_from(dir.to_string())
+                    && let path = std::path::PathBuf::from(dir)
                 {
                     let mut cache = self.cache.write();
                     if cache.root_as_str() != Some(path.to_string_lossy().as_ref()) {

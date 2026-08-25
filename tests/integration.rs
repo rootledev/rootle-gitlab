@@ -556,20 +556,23 @@ async fn handshake_cache_dir_wins_over_the_default() {
         "cache_dir": handshake_dir.to_string_lossy(),
     }})
     .to_string();
-    let uri = server.uri();
     std::thread::scope(|s| {
-        s.spawn(move || {
-            let h = Handler::new(&uri, "GL_TEST_TOKEN", Some(default_dir));
+        s.spawn(|| {
+            let h = Handler::new(&server.uri(), "GL_TEST_TOKEN", Some(default_dir));
             respond(&h, &line)
         })
         .join()
         .unwrap()
         .unwrap();
     });
-    // A second handler on the SAME process would share the re-rooted
-    // cache; instead verify indirectly: the re-root happened during
-    // initialize (usage reported from the handshake dir, which is
-    // empty → 0).
-    let r = ask(&uri, &handshake_dir, "initialize", json!({"protocol": 1}));
+    // Verify the re-root landed: usage is reported from the handshake
+    // dir, which is empty → 0 (a non-re-rooted handler would report
+    // its own dir's contents instead).
+    let r = ask(
+        &server.uri(),
+        &handshake_dir,
+        "initialize",
+        json!({"protocol": 1}),
+    );
     assert_eq!(result(r)["cache"]["bytes"], 0);
 }
