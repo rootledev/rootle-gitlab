@@ -40,18 +40,35 @@ pub struct GitLab {
     token: std::sync::OnceLock<String>,
 }
 
+/// Null-tolerant by necessity (reader-tolerance protocol rule): empty
+/// repos have `default_branch: null`, and `simple=true` listings can
+/// omit optional fields — one odd project in a page must not fail the
+/// whole listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: u64,
     pub path_with_namespace: String,
-    pub default_branch: String,
-    pub web_url: String,
-    pub http_url_to_repo: String,
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    #[serde(default)]
+    pub web_url: Option<String>,
+    #[serde(default)]
+    pub http_url_to_repo: Option<String>,
 }
 
 impl Project {
-    pub fn cache_fields(&self) -> Project {
-        self.clone()
+    pub fn branch(&self) -> String {
+        self.default_branch.clone().unwrap_or_else(|| "main".into())
+    }
+    pub fn web(&self) -> String {
+        self.web_url
+            .clone()
+            .unwrap_or_else(|| format!("https://gitlab.com/{}", self.path_with_namespace))
+    }
+    pub fn clone_remote(&self) -> String {
+        self.http_url_to_repo
+            .clone()
+            .unwrap_or_else(|| format!("https://gitlab.com/{}.git", self.path_with_namespace))
     }
 }
 

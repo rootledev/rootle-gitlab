@@ -147,6 +147,38 @@ async fn search_repos_mixes_projects_and_orgs() {
 }
 
 #[tokio::test]
+async fn org_repos_tolerate_empty_repos() {
+    let server = MockServer::start().await;
+    token_env_set();
+    Mock::given(method("GET"))
+        .and(path("/api/v4/groups/tools"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": 5, "full_path": "tools", "web_url": "u"})),
+        )
+        .mount(&server)
+        .await;
+    // An empty repo: default_branch null, urls absent — one bad shape
+    // in the page must not sink the listing.
+    Mock::given(method("GET"))
+        .and(path("/api/v4/groups/5/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 10, "path_with_namespace": "tools/empty", "default_branch": null},
+            project_json(11, "tools/full"),
+        ])))
+        .mount(&server)
+        .await;
+    let cache = tempdir();
+    let r = result(ask(
+        &server.uri(),
+        &cache,
+        "org/repos",
+        json!({"org": "tools"}),
+    ));
+    assert_eq!(r["repos"], json!(["empty", "full"]));
+}
+
+#[tokio::test]
 async fn org_repos_strip_the_org_component_nested_kept() {
     let server = MockServer::start().await;
     token_env_set();

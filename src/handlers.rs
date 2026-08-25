@@ -124,7 +124,7 @@ impl Handler {
         }
         match self.gl.project(path) {
             Ok(p) => {
-                self.cache.put_project(&p.cache_fields());
+                self.cache.put_project(&p);
                 Ok(p)
             }
             Err(ApiError::Api { status: 404, .. }) => {
@@ -178,7 +178,7 @@ impl Handler {
 
     fn repo_tree(&self, repo: &str) -> WireResult {
         let project = self.project(repo).map_err(|e| WireError::from_api(&e))?;
-        let branch = project.default_branch.clone();
+        let branch = project.branch();
         // Branch head first (mutable, one cheap call): a cached tree
         // keyed by the head sha is immutable thereafter.
         let head = match self.gl.branch_head(project.id, &branch) {
@@ -264,7 +264,7 @@ impl Handler {
         is_file: bool,
     ) -> WireResult {
         w(self.project(repo), |p| {
-            let mut url = p.web_url.clone();
+            let mut url = p.web();
             if !path.is_empty() {
                 let kind = if is_file { "blob" } else { "tree" };
                 // Slashes inside the branch or path are separators in
@@ -372,7 +372,7 @@ impl Handler {
 
     fn project_by_id(&self, id: u64) -> ApiResult<String> {
         let p: crate::api::Project = self.gl.get_json(&format!("/projects/{id}"), &[])?;
-        self.cache.put_project(&p.cache_fields());
+        self.cache.put_project(&p);
         Ok(p.path_with_namespace)
     }
 }
