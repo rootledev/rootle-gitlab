@@ -113,6 +113,9 @@ impl Handler {
                 Ok(json!({
                     "protocol": 1,
                     "name": "gitlab",
+                    // v1.3: modeline icon (rootle renders its gitlab
+                    // glyph when the user enables nerd_font).
+                    "icon": "gitlab",
                     // Optimistic: startup does NO network (restart
                     // obligations). Unavailable search surfaces as
                     // honest per-call errors, not startup failure.
