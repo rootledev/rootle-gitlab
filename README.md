@@ -1,5 +1,10 @@
 # rootle-gitlab
 
+[![ci](https://github.com/rootledev/rootle-gitlab/actions/workflows/ci.yml/badge.svg)](https://github.com/rootledev/rootle-gitlab/actions/workflows/ci.yml)
+[![audit](https://github.com/rootledev/rootle-gitlab/actions/workflows/audit.yml/badge.svg)](https://github.com/rootledev/rootle-gitlab/actions/workflows/audit.yml)
+[![crates.io](https://img.shields.io/crates/v/rootle-gitlab.svg)](https://crates.io/crates/rootle-gitlab)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 GitLab provider for [rootle](https://rootle.dev) — the first out-of-tree
 provider ([plans/0009](https://github.com/rootledev/rootle/blob/main/plans/0009-gitlab-provider.md)).
 It speaks rootle's stdio provider protocol (NDJSON-RPC 2.0 over
