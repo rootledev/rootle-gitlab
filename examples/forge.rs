@@ -30,11 +30,6 @@ use serde_json::{Value, json};
 /// set it ourselves so it survives even the suite's hermetic env.
 const TOKEN_ENV: &str = "FORGE_GITLAB_FC_TOKEN";
 
-/// The suite's lifecycle group roots its cache *inside* the fixture
-/// copy; it is bookkeeping, not a repo (the repo set is snapshotted at
-/// spawn, before any initialize could create it in generation 1).
-const SKIP_DIRS: [&str; 3] = ["cache", ".git", "__pycache__"];
-
 fn main() {
     let fixture: PathBuf = std::env::args_os()
         .nth(1)
@@ -46,17 +41,19 @@ fn main() {
         });
     let org = std::env::var("FORGE_ORG").unwrap_or_else(|_| "local".to_string());
 
-    // Snapshot the repo set at spawn: dirs of the fixture root.
+    // Snapshot the repo set at spawn: every dir of the fixture root is
+    // a repo (the suite roots adapter caches BESIDE the fixture, never
+    // inside it — pinned suite revision 7302996).
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&fixture).expect("read fixture dir") {
         let Ok(e) = entry else { continue };
         if e.path().is_dir()
             && let Some(n) = e.file_name().to_str()
-            && !SKIP_DIRS.contains(&n)
         {
             names.push(n.to_string());
         }
     }
+
     names.sort();
     assert!(!names.is_empty(), "fixture {fixture:?} holds no repos");
     let repos: Vec<Repo> = names
