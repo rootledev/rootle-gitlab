@@ -78,11 +78,11 @@ docker compose run --build --rm test     # fmt + clippy -D warnings + wiremock s
 docker compose run --build --rm release  # static musl tarball → ./dist/
 ```
 
-The wiremock suite (`tests/integration.rs`) is the offline
-conformance gate: every protocol method against a scripted GitLab API,
-including paginated trees, cache hits, the error taxonomy, and the
-qualifier translation. Live validation against gitlab.com runs as a
-dispatch-only CI job with a token secret.
+The wiremock suites (in `src/handlers/`, beside the handlers they
+cover) are the offline conformance gate: every protocol method against
+a scripted GitLab API, including paginated trees, cache hits, the
+error taxonomy, and the qualifier translation. Live validation against
+gitlab.com runs as a dispatch-only CI job with a token secret.
 
 ## License
 

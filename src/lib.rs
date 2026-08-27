@@ -35,3 +35,28 @@ pub fn respond(handler: &Handler, line: &str) -> Option<String> {
     };
     Some(reply.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::handlers::testkit::tempdir;
+    use crate::{Handler, respond};
+    use serde_json::json;
+    use wiremock::MockServer;
+
+    #[tokio::test]
+    async fn notifications_without_an_id_are_ignored() {
+        let server = MockServer::start().await;
+        let cache = tempdir();
+        let line =
+            json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id": 7}}).to_string();
+        let reply = std::thread::scope(|s| {
+            s.spawn(move || {
+                let h = Handler::new(&server.uri(), "GL_TEST_TOKEN", Some(cache));
+                respond(&h, &line)
+            })
+            .join()
+            .unwrap()
+        });
+        assert!(reply.is_none());
+    }
+}

@@ -1,8 +1,20 @@
 //! Protocol method handlers: one function per method, mapping between
 //! the wire shapes (doc/provider-protocol.md) and the GitLab API.
 //! Handlers are pure request→result — stdin plumbing lives in main.
+//!
+//! This surface file owns dispatch, the wire error taxonomy, and the
+//! helpers shared across methods; the per-method handlers live in
+//! sibling submodules (`handlers/`), each beside the wiremock tests
+//! that cover it (the house rule).
 
-use crate::api::{self, ApiError, ApiResult, GitLab, TREE_ENTRY_CAP};
+mod blob;
+mod code;
+mod initialize;
+mod search;
+mod tree;
+mod urls;
+
+use crate::api::{ApiError, ApiResult, GitLab};
 use crate::cache::Cache;
 use serde_json::{Value, json};
 
@@ -87,42 +99,7 @@ impl Handler {
 
     pub fn dispatch(&self, method: &str, params: &Value) -> WireResult {
         match method {
-            "initialize" => {
-                // The handshake's cache_dir wins over the default —
-                // rootle owns the subtree naming (protocol v1.2) and
-                // respawns re-send it, so re-rooting is idempotent.
-                if let Some(dir) = params["cache_dir"].as_str()
-                    && let path = std::path::PathBuf::from(dir)
-                {
-                    let mut cache = self.cache.write();
-                    if cache.root_as_str() != Some(path.to_string_lossy().as_ref()) {
-                        *cache = Cache::new(Some(path));
-                    }
-                }
-                let cache = self.cache.read();
-                // Advisory cache budget (protocol v1.2): evict our
-                // subtree past it and report current usage — one
-                // [cache] max_mb knob in :settings governs every
-                // backend. Local stat walk only; startup stays
-                // network-free (restart obligations).
-                let budget = params["cache_bytes"].as_u64().unwrap_or(0);
-                if budget > 0 {
-                    cache.enforce_budget(budget);
-                }
-                let usage = cache.size_bytes();
-                Ok(json!({
-                    "protocol": 1,
-                    "name": "gitlab",
-                    // v1.3: modeline icon (rootle renders its gitlab
-                    // glyph when the user enables nerd_font).
-                    "icon": "gitlab",
-                    // Optimistic: startup does NO network (restart
-                    // obligations). Unavailable search surfaces as
-                    // honest per-call errors, not startup failure.
-                    "capabilities": { "orgs": true, "code_search": true },
-                    "cache": { "bytes": usage }
-                }))
-            }
+            "initialize" => self.initialize(params),
             "search/repos" => self.search_repos(params["query"].as_str().unwrap_or("")),
             "org/repos" => self.org_repos(params["org"].as_str().unwrap_or("")),
             "repo/tree" => self.repo_tree(params["repo"].as_str().unwrap_or("")),
@@ -171,250 +148,180 @@ impl Handler {
     fn group_id(&self, org: &str) -> ApiResult<u64> {
         Ok(self.gl.group(org)?.id)
     }
+}
 
-    fn search_repos(&self, query: &str) -> WireResult {
-        w(self.gl.search_projects(query), |projects| {
-            let mut items: Vec<Value> = projects
-                .into_iter()
-                .map(|p| json!({ "full_name": p.path_with_namespace }))
-                .collect();
-            if let Ok(groups) = self.gl.search_groups(query) {
-                for g in groups {
-                    items.push(json!({ "org": g.full_path }));
-                }
-            }
-            json!({ "items": items.into_iter().take(20).collect::<Vec<_>>() })
-        })
-    }
+/// Shared scaffolding for the wiremock suites living beside the
+/// handlers: the offline conformance harness. No network beyond the
+/// mock, deterministic, runs in CI. Tests drive the same `respond()`
+/// the binary's stdin loop uses.
+#[cfg(test)]
+pub(crate) mod testkit {
+    use crate::handlers::Handler;
+    use crate::respond;
+    use serde_json::{Value, json};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn org_repos(&self, org: &str) -> WireResult {
-        let id = self.group_id(org)?;
-        w(self.gl.group_projects(id), |(projects, truncated)| {
-            // The repos level carries the path AFTER the org component
-            // (rootle re-joins org + name); nested subgroups keep the
-            // rest of their path — multi-slash ids are legal.
-            let prefix = format!("{org}/");
-            json!({
-                "repos": projects
-                    .into_iter()
-                    .map(|p| {
-                        p.path_with_namespace
-                            .strip_prefix(&prefix)
-                            .map(str::to_string)
-                            .unwrap_or(p.path_with_namespace)
-                    })
-                    .collect::<Vec<String>>(),
-                "truncated": truncated,
+    /// reqwest::blocking's client owns a runtime and may neither be
+    /// created nor dropped inside a tokio worker — so the handler is
+    /// constructed, used, and dropped on a plain (scoped) thread. The
+    /// disk cache (tempdir) carries state across asks.
+    pub(crate) fn ask(uri: &str, cache: &std::path::Path, method: &str, params: Value) -> Value {
+        let line = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let reply = std::thread::scope(|s| {
+            s.spawn(move || {
+                let handler = Handler::new(uri, "GL_TEST_TOKEN", Some(cache.to_path_buf()));
+                respond(&handler, &line)
             })
+            .join()
+            .expect("probe thread")
+        })
+        .expect("request line must produce a reply");
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    pub(crate) fn result(reply: Value) -> Value {
+        reply["result"].clone()
+    }
+
+    pub(crate) fn error(reply: Value) -> Value {
+        reply["error"].clone()
+    }
+
+    pub(crate) fn tempdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "rootle-gitlab-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    pub(crate) fn project_json(id: u64, path: &str) -> Value {
+        json!({
+            "id": id,
+            "path_with_namespace": path,
+            "default_branch": "main",
+            "web_url": format!("https://gitlab.example.com/{path}"),
+            "http_url_to_repo": format!("https://gitlab.example.com/{path}.git"),
         })
     }
 
-    fn repo_tree(&self, repo: &str) -> WireResult {
-        let project = self.project(repo).map_err(|e| WireError::from_api(&e))?;
-        let branch = project.branch();
-        // Branch head first (mutable, one cheap call): a cached tree
-        // keyed by the head sha is immutable thereafter.
-        let head = match self.gl.branch_head(project.id, &branch) {
-            Ok(h) => h,
-            Err(e) => return Err(WireError::from_api(&e)),
-        };
-        let cached = self.cache.read().tree(&head);
-        if let Some(cached) = cached
-            && let Ok(v) = serde_json::from_slice::<Value>(&cached)
-        {
-            return Ok(v);
-        }
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        let mut page = 1u32;
-        loop {
-            let batch = match self.gl.tree_page(project.id, &branch, page) {
-                Ok(b) => b,
-                Err(e) => return Err(WireError::from_api(&e)),
-            };
-            let n = batch.len();
-            for e in batch {
-                entries.push(json!({
-                    "path": e.path,
-                    "type": e.kind,          // "blob" | "tree" — same words
-                    "sha": e.id,
-                }));
-            }
-            if n < 100 {
-                break;
-            }
-            if entries.len() >= TREE_ENTRY_CAP {
-                entries.truncate(TREE_ENTRY_CAP);
-                truncated = true;
-                break;
-            }
-            page += 1;
-        }
-        let body = json!({
-            "entries": entries,
-            "truncated": truncated,
-            "branch": branch,
+    pub(crate) async fn mock_project_lookup(server: &MockServer, id: u64, proj_path: &str) {
+        let enc = proj_path.replace('/', "%2F");
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/projects/{enc}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(project_json(id, proj_path)))
+            .mount(server)
+            .await;
+    }
+
+    /// Set once, process-wide (edition-2024 set_var is unsafe — fine in
+    /// tests, done exactly here).
+    pub(crate) fn token_env_set() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            std::env::set_var("GL_TEST_TOKEN", "glpat-test");
         });
-        self.cache
-            .read()
-            .put_tree(&head, body.to_string().as_bytes());
-        Ok(body)
-    }
-
-    fn repo_blob(&self, repo: &str, sha: &str) -> WireResult {
-        let cached = self.cache.read().blob(sha);
-        if let Some(bytes) = cached {
-            return Ok(json!({ "bytes_b64": b64(&bytes) }));
-        }
-        let project = self.project(repo).map_err(|e| WireError::from_api(&e))?;
-        let bytes = self
-            .gl
-            .blob_raw(project.id, sha)
-            .map_err(|e| WireError::from_api(&e))?;
-        if bytes.len() > api::BLOB_CAP {
-            return Err(WireError {
-                kind: "provider",
-                message: format!(
-                    "blob {sha} is {} KiB — over the 1 MiB preview cap",
-                    bytes.len() / 1024
-                ),
-                retry_after_s: None,
-            });
-        }
-        self.cache.read().put_blob(sha, &bytes);
-        Ok(json!({ "bytes_b64": b64(&bytes) }))
-    }
-
-    fn clone_url(&self, repo: &str) -> WireResult {
-        w(
-            self.project(repo),
-            |p| json!({ "clone_url": p.http_url_to_repo }),
-        )
-    }
-
-    fn web_url(
-        &self,
-        repo: &str,
-        path: &str,
-        branch: &str,
-        line: Option<u64>,
-        is_file: bool,
-    ) -> WireResult {
-        w(self.project(repo), |p| {
-            let mut url = p.web();
-            if !path.is_empty() {
-                let kind = if is_file { "blob" } else { "tree" };
-                // Slashes inside the branch or path are separators in
-                // GitLab's URL grammar — encode per segment, not whole.
-                let enc = |s: &str| {
-                    s.split('/')
-                        .map(api::urlencode_path)
-                        .collect::<Vec<_>>()
-                        .join("/")
-                };
-                url.push_str(&format!("/-/{kind}/{}", enc(branch)));
-                url.push('/');
-                url.push_str(&enc(path));
-            }
-            if is_file && line.is_some() {
-                url.push_str(&format!("#L{}", line.unwrap_or(0)));
-            }
-            json!({ "url": url })
-        })
-    }
-
-    fn org_url(&self, org: &str) -> WireResult {
-        w(self.gl.group(org), |g| json!({ "url": g.web_url }))
-    }
-
-    /// q grammar (the protocol's PROTOCOL SURFACE): repo:/org:/path:/
-    /// extension: qualifiers + free terms. repo: and org: scope the
-    /// GitLab search endpoint server-side; path:/extension: filter
-    /// client-side (no server equivalent). Hits carry GitLab's real
-    /// startline — located, no client-side locating needed.
-    fn search_code(&self, q: &str) -> WireResult {
-        let mut repo_scope = None;
-        let mut org_scope = None;
-        let mut path_filter = None;
-        let mut ext_filter = None;
-        let mut terms = Vec::new();
-        for tok in q.split_whitespace() {
-            let (key, value) = match tok.split_once(':') {
-                Some(kv) => kv,
-                None => {
-                    terms.push(tok);
-                    continue;
-                }
-            };
-            match key {
-                "repo" => repo_scope = Some(value.to_string()),
-                "org" => org_scope = Some(value.to_string()),
-                "path" => path_filter = Some(value.to_lowercase()),
-                "extension" => ext_filter = Some(value.trim_start_matches('.').to_lowercase()),
-                _ => terms.push(tok),
-            }
-        }
-        let search_terms = terms.join(" ");
-        let scope_path = if let Some(repo) = &repo_scope {
-            let project = self.project(repo).map_err(|e| WireError::from_api(&e))?;
-            format!("/projects/{}/search", project.id)
-        } else if let Some(org) = &org_scope {
-            let id = self.group_id(org).map_err(|e| WireError::from_api(&e))?;
-            format!("/groups/{id}/search")
-        } else {
-            "/search".to_string()
-        };
-        let hits = self
-            .gl
-            .search_blobs(&scope_path, &search_terms)
-            .map_err(|e| WireError::from_api(&e))?;
-
-        let mut items = Vec::new();
-        for hit in hits {
-            let path = hit.path.to_lowercase();
-            if let Some(p) = &path_filter
-                && !path.contains(p.as_str())
-            {
-                continue;
-            }
-            if let Some(ext) = &ext_filter
-                && !path.ends_with(&format!(".{ext}"))
-            {
-                continue;
-            }
-            // Resolve project ids to paths once each (cached).
-            let repo = match self.project_by_id(hit.project_id) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let line = hit.startline.unwrap_or(1);
-            let data = hit.data.clone().unwrap_or_default();
-            let match_count = terms
-                .iter()
-                .filter(|t| data.to_lowercase().contains(&t.to_lowercase()))
-                .count() as u32;
-            items.push(json!({
-                "repo": repo,
-                "path": hit.path,
-                "sha": "",
-                "branch": hit.branch(),
-                "line": line,
-                "preview": [[line, data]],
-                "match_count": match_count,
-                "located": true,
-            }));
-        }
-        Ok(json!({ "items": items, "truncated": false }))
-    }
-
-    fn project_by_id(&self, id: u64) -> ApiResult<String> {
-        let p: crate::api::Project = self.gl.get_json(&format!("/projects/{id}"), &[])?;
-        self.cache.read().put_project(&p);
-        Ok(p.path_with_namespace)
     }
 }
 
-fn b64(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+#[cfg(test)]
+mod tests {
+    use super::Handler;
+    use crate::handlers::testkit::{ask, error, tempdir, token_env_set};
+    use crate::respond;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn missing_token_is_a_lazy_auth_error() {
+        let server = MockServer::start().await;
+        // Distinct env name so the global GL_TEST_TOKEN can't leak in.
+        let cache = tempdir();
+        let line = json!({"jsonrpc":"2.0","id":1,"method":"repo/tree","params":{"repo":"g/r"}})
+            .to_string();
+        let reply = std::thread::scope(|s| {
+            s.spawn(move || {
+                let h = Handler::new(&server.uri(), "GL_TEST_TOKEN_ABSENT", Some(cache));
+                respond(&h, &line)
+            })
+            .join()
+            .unwrap()
+            .unwrap()
+        });
+        let e = error(serde_json::from_str(&reply).unwrap());
+        assert_eq!(e["data"]["kind"], "auth");
+        assert!(e["message"].as_str().unwrap().contains("GL_TEST_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn error_taxonomy_maps_status_to_kinds() {
+        let server = MockServer::start().await;
+        token_env_set();
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/g%2Fdenied"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"message": "401 Unauthorized"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/g%2Fgone"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"message": "404 Project Not Found"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/g%2Fthrottled"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "37")
+                    .set_body_json(json!({"message": "429 Too Many Requests"})),
+            )
+            .mount(&server)
+            .await;
+        let cache = tempdir();
+        assert_eq!(
+            error(ask(
+                &server.uri(),
+                &cache,
+                "repo/tree",
+                json!({"repo": "g/denied"})
+            ))["data"]["kind"],
+            "auth"
+        );
+        assert_eq!(
+            error(ask(
+                &server.uri(),
+                &cache,
+                "repo/tree",
+                json!({"repo": "g/gone"})
+            ))["data"]["kind"],
+            "not_found"
+        );
+        let limited = error(ask(
+            &server.uri(),
+            &cache,
+            "repo/tree",
+            json!({"repo": "g/throttled"}),
+        ));
+        assert_eq!(limited["data"]["kind"], "rate_limited");
+        assert_eq!(limited["data"]["retry_after_s"], 37);
+    }
+
+    #[tokio::test]
+    async fn unknown_method_is_a_provider_error() {
+        let server = MockServer::start().await;
+        let cache = tempdir();
+        let e = error(ask(&server.uri(), &cache, "repo/issues", json!({})));
+        assert_eq!(e["data"]["kind"], "provider");
+        assert!(e["message"].as_str().unwrap().contains("unknown method"));
+    }
 }

@@ -23,10 +23,11 @@ docker compose run --build --rm release   # static musl tarball → ./dist/
 |---|---|
 | `src/main.rs` | the stdin loop: line → dispatch → reply, flushed per line |
 | `src/lib.rs` | `respond()` — one line in, one line out (tests drive this) |
-| `src/handlers.rs` | protocol methods → GitLab API + q-grammar translation |
+| `src/handlers.rs` | protocol surface: dispatch, wire error taxonomy, shared helpers |
+| `src/handlers/*.rs` | per-method handlers (initialize/search/tree/blob/urls/code), each with the wiremock tests that cover it |
 | `src/api.rs` | REST client: lazy token, error taxonomy, page aggregation |
 | `src/cache.rs` | disk cache under `~/.cache/rootle/providers/rootle-gitlab/` |
-| `tests/integration.rs` | the offline conformance suite (wiremock) |
+| `tests/version_flag.rs` | the `--version` bin smoke test |
 
 ## Contract rules (violations get caught in review)
 
