@@ -4,7 +4,7 @@
 
 use super::{Handler, WireError, WireResult};
 use crate::api::ApiResult;
-use serde_json::json;
+use serde_json::{Value, json};
 
 impl Handler {
     /// q grammar (the protocol's PROTOCOL SURFACE): repo:/org:/path:/
@@ -13,6 +13,27 @@ impl Handler {
     /// client-side (no server equivalent). Hits carry GitLab's real
     /// startline — located, no client-side locating needed.
     pub(super) fn search_code(&self, q: &str) -> WireResult {
+        let items = self.code_items(q)?;
+        Ok(json!({ "items": items, "truncated": false }))
+    }
+
+    /// The streamed shape (v1.3 progressive results): one `$/partial`
+    /// batch carrying every hit — GitLab answers in a single page, so
+    /// there is nothing finer-grained to stream — then the
+    /// metadata-only reply; items ride the batch, `truncated` stays
+    /// authoritative (§Progressive results).
+    pub(super) fn search_code_streamed(
+        &self,
+        q: &str,
+        id: &Value,
+        emit: &mut dyn FnMut(Value),
+    ) -> WireResult {
+        let items = self.code_items(q)?;
+        emit(json!({ "id": id, "items": items }));
+        Ok(json!({ "items": [], "truncated": false }))
+    }
+
+    fn code_items(&self, q: &str) -> Result<Vec<Value>, WireError> {
         let mut repo_scope = None;
         let mut org_scope = None;
         let mut path_filter = None;
@@ -84,7 +105,7 @@ impl Handler {
                 "located": true,
             }));
         }
-        Ok(json!({ "items": items, "truncated": false }))
+        Ok(items)
     }
 
     fn project_by_id(&self, id: u64) -> ApiResult<String> {
@@ -145,6 +166,50 @@ mod tests {
         assert_eq!(items[0]["branch"], "main");
         assert_eq!(items[0]["preview"][0][1], "pub fn render() {}");
         assert_eq!(items[0]["match_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn streamed_search_emits_one_partial_then_a_metadata_reply() {
+        let server = MockServer::start().await;
+        token_env_set();
+        mock_project_lookup(&server, 42, "g/r").await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(project_json(42, "g/r")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/42/search"))
+            .and(query_param("scope", "blobs"))
+            .and(query_param("search", "render"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"project_id": 42, "path": "src/lib.rs", "ref": "main",
+                 "startline": 12, "data": "pub fn render() {}"},
+                {"project_id": 42, "path": "src/other.rs", "ref": "main",
+                 "startline": 9, "data": "pub fn render_thing() {}"}
+            ])))
+            .mount(&server)
+            .await;
+        let cache = tempdir();
+        let lines = crate::handlers::testkit::ask_lines(
+            &server.uri(),
+            &cache,
+            "search/code",
+            json!({"q": "render repo:g/r", "partial": true}),
+        );
+        // v1.3 progressive results: the batch(es) precede the reply,
+        // each $/partial carries the request id, and the reply is
+        // metadata-only (items ride the batches).
+        assert_eq!(lines.len(), 2, "one batch then the reply: {lines:?}");
+        assert_eq!(lines[0]["method"], "$/partial");
+        assert_eq!(
+            lines[0]["params"]["id"], 1,
+            "the batch echoes the request id"
+        );
+        assert_eq!(lines[0]["params"]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(lines[1]["id"], 1);
+        assert_eq!(lines[1]["result"]["items"], json!([]));
+        assert_eq!(lines[1]["result"]["truncated"], false);
     }
 
     #[tokio::test]

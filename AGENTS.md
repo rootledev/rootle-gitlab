@@ -21,13 +21,14 @@ docker compose run --build --rm release   # static musl tarball → ./dist/
 
 | Path | Contents |
 |---|---|
-| `src/main.rs` | the stdin loop: line → dispatch → reply, flushed per line |
-| `src/lib.rs` | `respond()` — one line in, one line out (tests drive this) |
+| `src/main.rs` | arg parsing + the shared stdin loop (`serve_stdio`) |
+| `src/lib.rs` | `respond()`/`respond_transcript()` (one line in → reply lines out; tests drive this) + `serve_stdio` |
 | `src/handlers.rs` | protocol surface: dispatch, wire error taxonomy, shared helpers |
 | `src/handlers/*.rs` | per-method handlers (initialize/search/tree/blob/urls/code), each with the wiremock tests that cover it |
 | `src/api.rs` | REST client: lazy token, error taxonomy, page aggregation |
 | `src/cache.rs` | disk cache under `~/.cache/rootle/providers/rootle-gitlab/` |
 | `tests/version_flag.rs` | the `--version` bin smoke test |
+| `examples/forge.rs` | forge-conformance harness: the canonical fixture behind a local GitLab REST v4 mock (plans/0015) |
 
 ## Contract rules (violations get caught in review)
 
@@ -53,6 +54,9 @@ docker compose run --build --rm release   # static musl tarball → ./dist/
   required. The wiremock suite must stay offline-deterministic — no
   network in CI tests; live gitlab.com validation is the dispatch-only
   job (`workflow_dispatch` with the `GITLAB_TOKEN` secret).
+- The `forge` job runs the canonical conformance suite
+  (rootledev/forge-conformance, plans/0015) against `examples/forge.rs`
+  — protocol revisions must keep the FC case matrix green.
 - Releases: tag `vX.Y.Z` matching Cargo.toml; the release workflow
   builds the 4-target matrix (linux + macOS, x86_64 + aarch64),
   verifies each tarball, publishes to crates.io and the GitHub

@@ -125,6 +125,25 @@ impl Handler {
         }
     }
 
+    /// The streaming entry (v1.3 progressive results): `search/code`
+    /// with `partial: true` emits its batch(es) through `emit` — each
+    /// call receives the `$/partial` params object, already carrying
+    /// the request id — and answers metadata-only. Everything else
+    /// falls through to the one-shot `dispatch` unchanged.
+    pub fn dispatch_streaming(
+        &self,
+        method: &str,
+        params: &Value,
+        id: &Value,
+        emit: &mut dyn FnMut(Value),
+    ) -> WireResult {
+        if method == "search/code" && params["partial"].as_bool().unwrap_or(false) {
+            self.search_code_streamed(params["q"].as_str().unwrap_or(""), id, emit)
+        } else {
+            self.dispatch(method, params)
+        }
+    }
+
     /// Project metadata through the cache; a 404 invalidates a stale
     /// entry once (repo moved/renamed) and retries fresh.
     fn project(&self, path: &str) -> ApiResult<crate::api::Project> {
@@ -178,6 +197,31 @@ pub(crate) mod testkit {
         })
         .expect("request line must produce a reply");
         serde_json::from_str(&reply).unwrap()
+    }
+
+    /// The full stdout transcript for one request line, in order —
+    /// streaming requests yield their `$/partial` lines before the
+    /// reply. Same probe-thread rules as `ask`.
+    pub(crate) fn ask_lines(
+        uri: &str,
+        cache: &std::path::Path,
+        method: &str,
+        params: Value,
+    ) -> Vec<Value> {
+        let line = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let lines = std::thread::scope(|s| {
+            s.spawn(move || {
+                let handler = Handler::new(uri, "GL_TEST_TOKEN", Some(cache.to_path_buf()));
+                crate::respond_transcript(&handler, &line)
+            })
+            .join()
+            .expect("probe thread")
+        })
+        .expect("request line must produce a reply");
+        lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     pub(crate) fn result(reply: Value) -> Value {

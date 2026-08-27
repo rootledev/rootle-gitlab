@@ -1,8 +1,10 @@
-//! The stdin loop: read a line, dispatch, reply, flush. Nothing else —
-//! rootle owns this process's lifecycle and may respawn it at any
-//! time (initialize runs once per generation, cheaply).
+//! Argument parsing plus the stdin loop (in `rootle_gitlab::serve_stdio`):
+//! read a line, dispatch, write the reply lines (v1.3 progressive
+//! results may interleave `$/partial` notifications), flush per line.
+//! Nothing else — rootle owns this process's lifecycle and may respawn
+//! it at any time (initialize runs once per generation, cheaply).
 
-use rootle_gitlab::{Handler, api, respond};
+use rootle_gitlab::{Handler, api, serve_stdio};
 
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -25,19 +27,5 @@ fn main() {
         }
     }
 
-    let handler = Handler::new(&instance, &token_env, cache_base);
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    use std::io::BufRead;
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(reply) = respond(&handler, &line) {
-            println!("{reply}");
-            use std::io::Write;
-            let _ = out.flush();
-        }
-    }
+    serve_stdio(&Handler::new(&instance, &token_env, cache_base));
 }
