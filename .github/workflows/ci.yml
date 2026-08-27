@@ -26,10 +26,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: rootledev/forge-conformance
-          # Pinned: 7302996 roots the adapter cache beside the fixture
-          # (never inside it) — the revision the harness is written for.
-          # Bump deliberately; suite main is not a moving dependency.
-          ref: 7302996778c0358bed5eb9ee99dcf9e38bfa0363
+          # Pinned by tag: v1.3.0 (= 7302996, which roots the adapter
+          # cache beside the fixture — never inside it) is the revision
+          # the harness is written for. Tags track protocol revisions;
+          # bump deliberately alongside rootle protocol bumps.
+          ref: v1.3.0
           path: forge-conformance
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
