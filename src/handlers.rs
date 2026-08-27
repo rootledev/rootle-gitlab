@@ -7,9 +7,12 @@
 //! sibling submodules (`handlers/`), each beside the wiremock tests
 //! that cover it (the house rule).
 
+mod blame;
 mod blob;
 mod code;
 mod initialize;
+mod log;
+mod refs;
 mod search;
 mod tree;
 mod urls;
@@ -85,6 +88,13 @@ impl From<ApiError> for WireError {
     }
 }
 
+/// An optional string param: JSON null and `""` both mean absent
+/// (rootle sends null for missing optionals — empty string is never
+/// a meaningful ref or path here).
+fn opt_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params[key].as_str().filter(|s| !s.is_empty())
+}
+
 fn w<T>(r: ApiResult<T>, f: impl FnOnce(T) -> Value) -> WireResult {
     r.map(f).map_err(|e| WireError::from_api(&e))
 }
@@ -102,10 +112,30 @@ impl Handler {
             "initialize" => self.initialize(params),
             "search/repos" => self.search_repos(params["query"].as_str().unwrap_or("")),
             "org/repos" => self.org_repos(params["org"].as_str().unwrap_or("")),
-            "repo/tree" => self.repo_tree(params["repo"].as_str().unwrap_or("")),
+            "repo/tree" => self.repo_tree(
+                params["repo"].as_str().unwrap_or(""),
+                opt_str(params, "ref"),
+            ),
             "repo/blob" => self.repo_blob(
                 params["repo"].as_str().unwrap_or(""),
                 params["sha"].as_str().unwrap_or(""),
+            ),
+            "repo/blob_at" => self.repo_blob_at(
+                params["repo"].as_str().unwrap_or(""),
+                params["path"].as_str().unwrap_or(""),
+                opt_str(params, "ref"),
+            ),
+            "repo/refs" => self.repo_refs(params["repo"].as_str().unwrap_or("")),
+            "repo/log" => self.repo_log(
+                params["repo"].as_str().unwrap_or(""),
+                opt_str(params, "path"),
+                opt_str(params, "ref"),
+                params["limit"].as_u64(),
+            ),
+            "repo/blame" => self.repo_blame(
+                params["repo"].as_str().unwrap_or(""),
+                params["path"].as_str().unwrap_or(""),
+                opt_str(params, "ref"),
             ),
             "repo/clone_url" => self.clone_url(params["repo"].as_str().unwrap_or("")),
             "repo/web_url" => self.web_url(
