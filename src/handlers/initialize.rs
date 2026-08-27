@@ -39,7 +39,15 @@ impl Handler {
             // Optimistic: startup does NO network (restart
             // obligations). Unavailable search surfaces as
             // honest per-call errors, not startup failure.
-            "capabilities": { "orgs": true, "code_search": true },
+            // The v1.5 revision trio (refs/log/blame, default
+            // false in the protocol) is all native GitLab REST.
+            "capabilities": {
+                "orgs": true,
+                "code_search": true,
+                "refs": true,
+                "log": true,
+                "blame": true
+            },
             "cache": { "bytes": usage }
         }))
     }
@@ -66,6 +74,9 @@ mod tests {
         assert_eq!(r["protocol"], 1);
         assert_eq!(r["name"], "gitlab");
         assert_eq!(r["capabilities"]["code_search"], true);
+        assert_eq!(r["capabilities"]["refs"], true, "v1.5 refs declared");
+        assert_eq!(r["capabilities"]["log"], true, "v1.5 log declared");
+        assert_eq!(r["capabilities"]["blame"], true, "v1.5 blame declared");
     }
 
     #[tokio::test]

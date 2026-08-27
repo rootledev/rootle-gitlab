@@ -19,6 +19,19 @@ pub const BLOB_CAP: usize = 1024 * 1024;
 /// listing reports `truncated: true` (plans/0009 F4).
 pub const TREE_ENTRY_CAP: usize = 25_000;
 
+/// Branch/tag listings aggregate up to this many names — the same
+/// honesty budget as trees (protocol v1.5: `repo/refs` has no wire
+/// slot for a truncated flag, so the cap rides reader tolerance and
+/// only speaks when hit).
+pub const REF_LIST_CAP: usize = 25_000;
+
+/// `repo/log` budget (bounded-compute contract): the client's `limit`
+/// is the render budget; absent means this default (rootle's own
+/// 500-hit budget), and larger asks cap here — `truncated: true`
+/// names the capper.
+pub const LOG_DEFAULT_LIMIT: usize = 500;
+pub const LOG_MAX_LIMIT: usize = 1_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{message}")]
@@ -89,12 +102,61 @@ pub struct TreeEntry {
 
 #[derive(Debug, Deserialize)]
 pub struct Branch {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The default-branch flag — compared by name too, since the
+    /// single-branch endpoint on old instances omits it.
+    #[serde(default)]
+    pub default: Option<bool>,
     pub commit: BranchCommit,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct BranchCommit {
     pub id: String,
+}
+
+/// Tag listing entry (`repository/tags`): `commit` is the peeled
+/// commit the tag points at — the sha a tree-at-tag resolves to.
+#[derive(Debug, Deserialize)]
+pub struct Tag {
+    pub name: String,
+    #[serde(default)]
+    pub commit: Option<BranchCommit>,
+}
+
+/// Commit listing entry (`repository/commits`): `title` is the
+/// subject (first line); `committed_date` arrives ISO-8601 and rides
+/// the wire verbatim — rootle never re-derives authorship.
+#[derive(Debug, Deserialize)]
+pub struct CommitEntry {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub author_name: Option<String>,
+    #[serde(default)]
+    pub committed_date: Option<String>,
+}
+
+/// One blame chunk (`repository/files/:path/blame`): the commit every
+/// line in `lines` last changed. Adjacent chunks may share a commit —
+/// the protocol wants runs coalesced, the handler does that.
+#[derive(Debug, Deserialize)]
+pub struct BlameChunk {
+    #[serde(default)]
+    pub commit: Option<BlameCommit>,
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlameCommit {
+    pub id: String,
+    #[serde(default)]
+    pub author_name: Option<String>,
+    #[serde(default)]
+    pub committed_date: Option<String>,
 }
 
 /// Blob search hit — GitLab returns real line numbers (startline),
@@ -176,9 +238,9 @@ impl GitLab {
             .map_err(|e| ApiError::Network(e.to_string()))
     }
 
-    pub fn get_bytes(&self, path: &str) -> ApiResult<Vec<u8>> {
+    pub fn get_bytes(&self, path: &str, query: &[(&str, &str)]) -> ApiResult<Vec<u8>> {
         let token = self.token()?;
-        let req = self.http.get(self.url(path, &[])).bearer_auth(token);
+        let req = self.http.get(self.url(path, query)).bearer_auth(token);
         let resp = req.send().map_err(|e| map_send_err(&e))?;
         check_status(resp)?
             .bytes()
@@ -242,6 +304,39 @@ impl GitLab {
         Ok(b.commit.id)
     }
 
+    /// All branches, pages aggregated up to REF_LIST_CAP.
+    pub fn branches(&self, project_id: u64) -> ApiResult<(Vec<Branch>, bool)> {
+        self.get_pages(
+            &format!("/projects/{project_id}/repository/branches"),
+            &[],
+            REF_LIST_CAP,
+        )
+    }
+
+    /// All tags, same aggregation.
+    pub fn tags(&self, project_id: u64) -> ApiResult<(Vec<Tag>, bool)> {
+        self.get_pages(
+            &format!("/projects/{project_id}/repository/tags"),
+            &[],
+            REF_LIST_CAP,
+        )
+    }
+
+    /// The commit a tag points at (peeled) — ref resolution for a
+    /// tree at a tag, mirroring `branch_head` for branches.
+    pub fn tag_commit(&self, project_id: u64, tag: &str) -> ApiResult<String> {
+        let enc = urlencode_path(tag);
+        let t: Tag = self.get_json(
+            &format!("/projects/{project_id}/repository/tags/{enc}"),
+            &[],
+        )?;
+        t.commit.map(|c| c.id).ok_or_else(|| ApiError::Api {
+            status: 404,
+            message: format!("tag {tag} carries no commit"),
+            retry_after: None,
+        })
+    }
+
     pub fn tree_page(&self, project_id: u64, branch: &str, page: u32) -> ApiResult<Vec<TreeEntry>> {
         let page_s = page.to_string();
         self.get_json(
@@ -256,9 +351,72 @@ impl GitLab {
     }
 
     pub fn blob_raw(&self, project_id: u64, sha: &str) -> ApiResult<Vec<u8>> {
-        self.get_bytes(&format!(
-            "/projects/{project_id}/repository/blobs/{sha}/raw"
-        ))
+        self.get_bytes(
+            &format!("/projects/{project_id}/repository/blobs/{sha}/raw"),
+            &[],
+        )
+    }
+
+    /// Raw file bytes at a ref (`repository/files/:path/raw`) — the
+    /// ref may be a branch, tag, or commit sha; an unknown path or
+    /// ref answers 404 (→ `not_found` on the wire).
+    pub fn raw_file_at(&self, project_id: u64, path: &str, ref_name: &str) -> ApiResult<Vec<u8>> {
+        let enc = urlencode_path(path);
+        self.get_bytes(
+            &format!("/projects/{project_id}/repository/files/{enc}/raw"),
+            &[("ref", ref_name)],
+        )
+    }
+
+    /// Blame chunks at a ref; coalescing is the handler's job.
+    pub fn blame(&self, project_id: u64, path: &str, ref_name: &str) -> ApiResult<Vec<BlameChunk>> {
+        let enc = urlencode_path(path);
+        self.get_json(
+            &format!("/projects/{project_id}/repository/files/{enc}/blame"),
+            &[("ref", ref_name)],
+        )
+    }
+
+    /// Commit log, newest first exactly as GitLab serves it. `want`
+    /// rides the bounded-compute contract: one item past `want` is
+    /// probed (per_page wants `want + 1`, pages of ≤ 100) so a
+    /// complete answer is distinguishable from a cliff — a short page
+    /// means done, anything past `want` means `truncated`.
+    pub fn commit_log(
+        &self,
+        project_id: u64,
+        path: Option<&str>,
+        ref_name: Option<&str>,
+        want: usize,
+    ) -> ApiResult<(Vec<CommitEntry>, bool)> {
+        let per_page = (want + 1).min(100);
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_s = page.to_string();
+            let per_page_s = per_page.to_string();
+            let mut q: Vec<(&str, &str)> = Vec::new();
+            if let Some(p) = path {
+                q.push(("path", p));
+            }
+            if let Some(r) = ref_name {
+                q.push(("ref_name", r));
+            }
+            q.push(("per_page", per_page_s.as_str()));
+            q.push(("page", page_s.as_str()));
+            let batch: Vec<CommitEntry> =
+                self.get_json(&format!("/projects/{project_id}/repository/commits"), &q)?;
+            let n = batch.len();
+            out.extend(batch);
+            if out.len() > want {
+                out.truncate(want);
+                return Ok((out, true));
+            }
+            if n < per_page {
+                return Ok((out, false));
+            }
+            page += 1;
+        }
     }
 
     pub fn search_projects(&self, query: &str) -> ApiResult<Vec<Project>> {
@@ -344,4 +502,17 @@ pub fn urlencode_path(s: &str) -> String {
         }
     }
     out
+}
+
+/// The git blob id of `bytes` — `sha1("blob <len>\0" ++ bytes)`. Real
+/// git framing, not an arbitrary hash: `repo/blob_at` reports it, and
+/// it then agrees with the ids the tree listings carry and is
+/// directly servable by `repo/blob` (`repository/blobs/:sha/raw`),
+/// so one content id works across every method.
+pub fn git_blob_sha(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(format!("blob {}\0", bytes.len()));
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }

@@ -8,7 +8,7 @@
 GitLab provider for [rootle](https://rootle.dev) — the first out-of-tree
 provider ([plans/0009](https://github.com/rootledev/rootle/blob/main/plans/0009-gitlab-provider.md)).
 It speaks rootle's stdio provider protocol (NDJSON-RPC 2.0 over
-stdin/stdout — the spec lives in
+stdin/stdout, protocol v1.5 — the spec lives in
 [doc/provider-protocol.md](https://github.com/rootledev/rootle/blob/main/doc/provider-protocol.md))
 against GitLab's REST v4 API. One static binary, no shared code with
 rootle: the wire contract is the entire interface.
@@ -66,6 +66,16 @@ honestly on the status line rather than silently.
   sha-keyed trees/blobs (immutable), project metadata (revalidated on
   404). Every path component is percent-encoded: branch names with `/`
   are legitimate, `..` never becomes path structure.
+- **Revision awareness (protocol v1.5)**: `repo/refs` (branches +
+  tags, the default flagged), `repo/tree` at any branch, tag, or
+  commit sha (resolved to its sha — the tree cache stays
+  content-keyed), `repo/log` (`path`/`ref`/`limit`; the limit rides
+  the bounded-compute contract — default 500, cap 1000,
+  `truncated: true` past either), `repo/blob_at`, and `repo/blame`
+  (adjacent same-sha ranges coalesced). The handshake declares
+  capabilities `refs`/`log`/`blame`. `repo/blob_at`'s sha is the git
+  blob id of the bytes — the same id family the tree listings carry,
+  so the sha feeds straight back into `repo/blob`.
 - **Errors** map onto the protocol taxonomy: 401/403 → `auth`,
   429 → `rate_limited` (+ `retry_after_s` from `Retry-After`),
   404 → `not_found`, timeouts → `timeout`, connect failures →
