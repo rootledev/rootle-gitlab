@@ -14,3 +14,26 @@ jobs:
 
       - name: Build gate (fmt, clippy, wiremock conformance)
         run: docker compose run --build --rm test
+
+  # The canonical provider conformance suite (rootledev/forge-conformance,
+  # plans/0015) against THIS adapter: examples/forge.rs serves the
+  # canonical fixture through a local GitLab REST v4 mock and runs the
+  # real handler against it — the numbered FC case matrix, protocol v1.3.
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: rootledev/forge-conformance
+          path: forge-conformance
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install pytest
+        run: python -m pip install pytest
+      - name: Build the fixture harness
+        run: cargo build --locked --example forge
+      - name: Suite vs this adapter
+        run: python3 forge-conformance/run -- "$PWD/target/debug/examples/forge"
