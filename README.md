@@ -97,7 +97,7 @@ cover) are the offline gate: every protocol method against a scripted
 GitLab API, including paginated trees, cache hits, the error taxonomy,
 and the qualifier translation. On top of that, this adapter is gated
 by [rootledev/forge-conformance](https://github.com/rootledev/forge-conformance)
-(v1.5.0, 47 cases) in CI — the canonical provider-conformance suite
+(v1.5.1, 47 cases) in CI — the canonical provider-conformance suite
 (pinned by tag; tags track protocol revisions). `examples/forge.rs`
 serves the canonical fixture through a local GitLab mock — plain
 directories walked from disk, and the `fixture/vcs` git repo answered
