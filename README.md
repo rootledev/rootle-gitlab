@@ -13,13 +13,21 @@ stdin/stdout, protocol v1.5 — the spec lives in
 against GitLab's REST v4 API. One static binary, no shared code with
 rootle: the wire contract is the entire interface.
 
-## Point rootle at GitLab
+## Install
 
-```toml
-# ~/.config/rootle/config.toml
-[provider]
-kind = "stdio"
-command = ["rootle-gitlab"]           # self-hosted: append "--instance", "https://gitlab.example.com"
+rootle's provider manager does it — the released tarball is installed
+checksum-verified (against its `.sha256` sidecar) and tracked for
+`rootle provider update`/`upgrade`:
+
+```sh
+rootle provider install gitlab    # bare name → rootledev/rootle-gitlab releases
+rootle provider use gitlab        # writes [provider] into config.toml
+```
+
+Self-hosted GitLab? Pass the flags through:
+
+```sh
+rootle provider use gitlab -- --instance https://gitlab.example.com
 ```
 
 The token is read lazily from the environment (never at startup —
@@ -29,10 +37,6 @@ rootle may respawn this process many times per session):
 export GITLAB_TOKEN=glpat-…   # scopes: read_api + read_repository
 rootle                        # search GitLab, browse, grep, yank URLs
 ```
-
-Install: `cargo install rootle-gitlab`, or a prebuilt tarball from
-[releases](https://github.com/rootledev/rootle-gitlab/releases)
-(linux + macOS, x86_64 + aarch64).
 
 ## The `q` grammar translation
 
@@ -65,7 +69,7 @@ honestly on the status line rather than silently.
 - **Cache** lives at `~/.cache/rootle/providers/rootle-gitlab/` —
   sha-keyed trees/blobs (immutable), project metadata (revalidated on
   404). Every path component is percent-encoded: branch names with `/`
-  are legitimate, `..` never becomes path structure.
+  are legitimate; `..` never becomes path structure.
 - **Revision awareness (protocol v1.5)**: `repo/refs` (branches +
   tags, the default flagged), `repo/tree` at any branch, tag, or
   commit sha (resolved to its sha — the tree cache stays
@@ -89,15 +93,31 @@ docker compose run --build --rm release  # static musl tarball → ./dist/
 ```
 
 The wiremock suites (in `src/handlers/`, beside the handlers they
-cover) are the offline conformance gate: every protocol method against
-a scripted GitLab API, including paginated trees, cache hits, the
-error taxonomy, and the qualifier translation. The canonical
-provider-conformance suite
-([rootledev/forge-conformance](https://github.com/rootledev/forge-conformance),
-plans/0015) runs in CI too: `examples/forge.rs` serves the canonical
-fixture through a local GitLab mock, and the numbered FC case matrix
-must stay green. Live validation against gitlab.com runs as a
-dispatch-only CI job with a token secret.
+cover) are the offline gate: every protocol method against a scripted
+GitLab API, including paginated trees, cache hits, the error taxonomy,
+and the qualifier translation. On top of that, this adapter is gated
+by [rootledev/forge-conformance](https://github.com/rootledev/forge-conformance)
+(v1.5.0, 47 cases) in CI — the canonical provider-conformance suite
+(pinned by tag; tags track protocol revisions). `examples/forge.rs`
+serves the canonical fixture through a local GitLab mock — plain
+directories walked from disk, and the `fixture/vcs` git repo answered
+by git itself — and the full FC matrix must stay green. Live
+validation against gitlab.com runs as a dispatch-only CI job with a
+token secret.
+
+## Advanced: manual setup
+
+Skip the manager — `cargo install rootle-gitlab`, or a prebuilt static
+musl tarball from [releases](https://github.com/rootledev/rootle-gitlab/releases)
+(linux + macOS, x86_64 + aarch64) — and point rootle at the binary by
+hand:
+
+```toml
+# ~/.config/rootle/config.toml
+[provider]
+kind = "stdio"
+command = ["rootle-gitlab"]           # self-hosted: append "--instance", "https://gitlab.example.com"
+```
 
 ## License
 

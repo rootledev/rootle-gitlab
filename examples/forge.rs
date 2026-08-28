@@ -8,22 +8,33 @@
 //! the ordinary `Handler` at it — the wire the suite exercises is the
 //! wire production speaks against gitlab.com.
 //!
-//! Content ids are git-style blob sha1s computed fresh from disk, so
-//! they are stable across respawns (FC-013), move when content moves
-//! (FC-011), and never collide across different content (FC-012) —
-//! the §Content ids contract, by construction. Credentials are
-//! satisfied by an env var we set ourselves (the mock never checks
-//! it), so the suite's scrubbed and hermetic environments still work;
-//! the adapter still reads it lazily, exactly like production.
+//! Two serving shapes, one per fixture kind:
+//!
+//! - plain directories (`alpha`, `beta`) are walked from disk — content
+//!   ids are git-style blob sha1s (`api::git_blob_sha`) computed fresh
+//!   per request, stable across respawns (FC-013), content-keyed by
+//!   construction (FC-010..012); the branch head hashes the recursive
+//!   tree so a mutation (FC-011) busts the adapter's cache precisely.
+//! - `fixture/vcs` is a real git repo (the v1.5 revision fixture): its
+//!   answers come from git itself (`ls-tree`, `rev-parse`, `log`,
+//!   `show`, `blame --porcelain`), so served refs, logs, and blame
+//!   match the expectations the suite derives from the same repo —
+//!   ids included, since git blob ids ARE the content-id scheme.
+//!
+//! Credentials are satisfied by an env var we set ourselves (the mock
+//! never checks it), so the suite's scrubbed and hermetic environments
+//! still work; the adapter still reads it lazily, like production.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
-use rootle_gitlab::{Handler, serve_stdio};
+use rootle_gitlab::{Handler, api::git_blob_sha, serve_stdio};
 use serde_json::{Value, json};
+use sha1::{Digest, Sha1};
 
 /// The token var this harness provides. Deliberately NOT one of the
 /// names forge-conformance scrubs (GITLAB_TOKEN, FORGE_TOKEN, …): we
@@ -43,7 +54,7 @@ fn main() {
 
     // Snapshot the repo set at spawn: every dir of the fixture root is
     // a repo (the suite roots adapter caches BESIDE the fixture, never
-    // inside it — pinned suite revision 7302996).
+    // inside it — pinned suite revision v1.5.0).
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&fixture).expect("read fixture dir") {
         let Ok(e) = entry else { continue };
@@ -53,16 +64,20 @@ fn main() {
             names.push(n.to_string());
         }
     }
-
     names.sort();
     assert!(!names.is_empty(), "fixture {fixture:?} holds no repos");
     let repos: Vec<Repo> = names
         .into_iter()
         .enumerate()
-        .map(|(i, name)| Repo {
-            dir: fixture.join(&name),
-            name,
-            id: (i + 1) as u64,
+        .map(|(i, name)| {
+            let dir = fixture.join(&name);
+            let is_git = dir.join(".git").exists();
+            Repo {
+                dir,
+                name,
+                id: (i + 1) as u64,
+                is_git,
+            }
         })
         .collect();
 
@@ -93,14 +108,17 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------
-// The mock GitLab: repos, trees, blobs, search — all computed fresh
-// from the fixture bytes on every request (FC-011 mutates files).
+// The mock GitLab: projects, trees, blobs, search, and (for the git
+// fixture) the v1.5 revision surface — computed fresh per request.
 // ---------------------------------------------------------------------
 
 struct Repo {
     dir: PathBuf,
     name: String,
     id: u64,
+    /// A real git repo (fixture/vcs): refs, trees, logs, and blame are
+    /// answered by git itself.
+    is_git: bool,
 }
 
 struct ServerState {
@@ -146,9 +164,10 @@ impl ServerState {
                 query.insert(percent_decode(k), percent_decode(v));
             }
         }
-        // GitLab addresses projects by whole-path encoding
-        // (`group%2Fproject`) — decode per segment, after splitting,
-        // or the slash comes back and splits the route.
+        // GitLab addresses projects and file paths by whole-path
+        // encoding (`group%2Fproject`, `src%2Fmain.rs`) — decode per
+        // segment, after splitting, or the slashes come back and split
+        // the route.
         let segs: Vec<String> = raw_path
             .trim_matches('/')
             .split('/')
@@ -198,34 +217,53 @@ impl ServerState {
                 }
                 None => self.not_found("Project"),
             },
-            ["api", "v4", "projects", p, "repository", "tree"] => match self.project(p) {
-                Some(v) => {
-                    let id = v["id"].as_u64().expect("project id");
-                    match self.repos.iter().find(|r| r.id == id) {
-                        Some(r) => {
-                            let mut entries = Vec::new();
-                            walk_tree(&r.dir, "", &mut entries);
-                            self.json(200, Value::Array(entries))
-                        }
-                        None => self.not_found("Project"),
-                    }
-                }
+            ["api", "v4", "projects", p, "repository", "branches"] => match self.project(p) {
+                Some(v) => self.json(200, self.branches(self.repo_of(&v))),
                 None => self.not_found("Project"),
             },
             ["api", "v4", "projects", p, "repository", "branches", b] => match self.project(p) {
+                Some(v) => match self.branch_head(self.repo_of(&v), b) {
+                    Some(sha) => self.json(200, json!({ "name": b, "commit": { "id": sha } })),
+                    None => self.not_found("Branch"),
+                },
+                None => self.not_found("Project"),
+            },
+            ["api", "v4", "projects", p, "repository", "tags"] => match self.project(p) {
+                Some(v) => self.json(200, self.tags(self.repo_of(&v))),
+                None => self.not_found("Project"),
+            },
+            ["api", "v4", "projects", p, "repository", "tags", t] => match self.project(p) {
+                Some(v) => match self.tag_commit(self.repo_of(&v), t) {
+                    Some(sha) => self.json(200, json!({ "name": t, "commit": { "id": sha } })),
+                    None => self.not_found("Tag"),
+                },
+                None => self.not_found("Project"),
+            },
+            ["api", "v4", "projects", p, "repository", "commits"] => match self.project(p) {
+                Some(v) => self.json(200, self.commit_log(self.repo_of(&v), q)),
+                None => self.not_found("Project"),
+            },
+            ["api", "v4", "projects", p, "repository", "tree"] => match self.project(p) {
                 Some(v) => {
-                    let id = v["id"].as_u64().expect("project id");
-                    match self.repos.iter().find(|r| r.id == id) {
-                        Some(r) => {
-                            let mut entries = Vec::new();
-                            let root = walk_tree(&r.dir, "", &mut entries);
-                            let head = hex(&sha1(
-                                format!("commit\n{root}\n{}", percent_decode(b)).as_bytes(),
-                            ));
-                            self.json(200, json!({ "commit": { "id": head } }))
+                    let repo = self.repo_of(&v);
+                    let entries = match repo.is_git {
+                        // The ref arrives resolved to a commit sha (the
+                        // adapter resolves names first); git answers,
+                        // unknown shas 404.
+                        true => match q.get("ref").map(String::as_str) {
+                            Some(r) => match git_ls_tree(&repo.dir, r) {
+                                Some(e) => e,
+                                None => return self.not_found("Ref"),
+                            },
+                            None => Vec::new(),
+                        },
+                        false => {
+                            let mut e = Vec::new();
+                            walk_tree(&repo.dir, "", &mut e);
+                            e
                         }
-                        None => self.not_found("Project"),
-                    }
+                    };
+                    self.json(200, Value::Array(entries))
                 }
                 None => self.not_found("Project"),
             },
@@ -253,9 +291,48 @@ impl ServerState {
                 }
                 None => self.not_found("Project"),
             },
+            ["api", "v4", "projects", p, "repository", "files", f, "raw"] => {
+                match self.project(p) {
+                    Some(v) => {
+                        let repo = self.repo_of(&v);
+                        let ref_name = q.get("ref").cloned().unwrap_or_else(|| "main".into());
+                        match raw_file_at(repo, f, &ref_name) {
+                            Some(bytes) => (200, "application/octet-stream", bytes),
+                            None => self.not_found("File"),
+                        }
+                    }
+                    None => self.not_found("Project"),
+                }
+            }
+            [
+                "api",
+                "v4",
+                "projects",
+                p,
+                "repository",
+                "files",
+                f,
+                "blame",
+            ] => match self.project(p) {
+                Some(v) => {
+                    let repo = self.repo_of(&v);
+                    let ref_name = q.get("ref").cloned().unwrap_or_else(|| "main".into());
+                    match blame(repo, f, &ref_name) {
+                        Some(chunks) => self.json(200, Value::Array(chunks)),
+                        None => self.not_found("File"),
+                    }
+                }
+                None => self.not_found("Project"),
+            },
             _ => self.not_found("Route"),
         }
     }
+
+    fn repo_of(&self, project: &Value) -> &Repo {
+        let id = project["id"].as_u64().expect("project id");
+        self.repos.iter().find(|r| r.id == id).expect("repo by id")
+    }
+
     /// Project lookup: by numeric id or by full "{org}/{name}" path.
     fn project(&self, p: &str) -> Option<Value> {
         self.repos
@@ -353,6 +430,141 @@ impl ServerState {
         Value::Array(hits)
     }
 
+    /// Branch listing: git repos enumerate real refs (HEAD flagged as
+    /// the default); plain dirs report the one synthetic branch.
+    fn branches(&self, r: &Repo) -> Value {
+        if r.is_git {
+            let head = git_text(&r.dir, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let list: Vec<Value> = git_text(
+                &r.dir,
+                &[
+                    "for-each-ref",
+                    "refs/heads",
+                    "--format=%(refname:short)%00%(objectname)",
+                ],
+            )
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (name, sha) = l.split_once('\0')?;
+                let mut b = json!({ "name": name, "commit": { "id": sha } });
+                if name == head {
+                    b["default"] = json!(true);
+                }
+                Some(b)
+            })
+            .collect();
+            Value::Array(list)
+        } else {
+            Value::Array(vec![json!({
+                "name": "main",
+                "default": true,
+                "commit": { "id": self.fs_head(r) },
+            })])
+        }
+    }
+
+    /// Ref → commit sha for the single-branch endpoint: `git
+    /// rev-parse` for git repos, the synthetic tree-hash head for
+    /// plain dirs (the adapter's cache key either way).
+    fn branch_head(&self, r: &Repo, name: &str) -> Option<String> {
+        if r.is_git {
+            git_text(
+                &r.dir,
+                &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+            )
+            .map(|s| s.trim().to_string())
+        } else if name == "main" {
+            Some(self.fs_head(r))
+        } else {
+            None
+        }
+    }
+
+    /// Tag listing: peeled commits (what a tree-at-tag resolves to).
+    fn tags(&self, r: &Repo) -> Value {
+        if !r.is_git {
+            return Value::Array(Vec::new());
+        }
+        let list: Vec<Value> = git_text(&r.dir, &["tag", "-l"])
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|name| {
+                let sha = self.tag_commit(r, name)?;
+                Some(json!({ "name": name, "commit": { "id": sha } }))
+            })
+            .collect();
+        Value::Array(list)
+    }
+
+    fn tag_commit(&self, r: &Repo, name: &str) -> Option<String> {
+        if !r.is_git {
+            return None;
+        }
+        git_text(
+            &r.dir,
+            &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
+        )
+        .map(|s| s.trim().to_string())
+    }
+
+    /// Commit log (newest first), path-filtered, paged by the query —
+    /// git's own order and metadata, verbatim.
+    fn commit_log(&self, r: &Repo, q: &Query) -> Value {
+        if !r.is_git {
+            return Value::Array(Vec::new());
+        }
+        let mut args = vec![
+            "log".to_string(),
+            "--format=%H\x1f%s\x1f%an\x1f%cI".to_string(),
+        ];
+        if let Some(ref_name) = q.get("ref_name") {
+            args.push(ref_name.clone());
+        }
+        if let Some(path) = q.get("path") {
+            args.push("--".to_string());
+            args.push(path.clone());
+        }
+        let all: Vec<Value> =
+            git_text(&r.dir, &args.iter().map(String::as_str).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| {
+                    let (id, rest) = l.split_once('\x1f')?;
+                    let (title, rest) = rest.split_once('\x1f')?;
+                    let (author, date) = rest.split_once('\x1f')?;
+                    Some(json!({
+                        "id": id,
+                        "title": title,
+                        "author_name": author,
+                        "committed_date": date,
+                    }))
+                })
+                .collect();
+        let per_page: usize = q.get("per_page").and_then(|v| v.parse().ok()).unwrap_or(20);
+        let page: usize = q
+            .get("page")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .max(1);
+        let start = (page - 1) * per_page;
+        let slice: Vec<Value> = all.into_iter().skip(start).take(per_page).collect();
+        Value::Array(slice)
+    }
+
+    /// The plain-dir branch head: a hash over the recursive tree, so
+    /// any content mutation moves it (FC-011's cache-buster).
+    fn fs_head(&self, r: &Repo) -> String {
+        let mut entries = Vec::new();
+        let root = walk_tree(&r.dir, "", &mut entries);
+        let mut hasher = Sha1::new();
+        hasher.update(format!("commit\n{root}\nmain"));
+        format!("{:x}", hasher.finalize())
+    }
+
     fn json(&self, status: u16, v: Value) -> (u16, &'static str, Vec<u8>) {
         (status, "application/json", v.to_string().into_bytes())
     }
@@ -384,8 +596,134 @@ fn write_reply(mut stream: TcpStream, status: u16, ctype: &str, body: &[u8]) {
     let _ = stream.flush();
 }
 
-/// Every file under `dir` as (repo-relative path, bytes), fresh from
-/// disk, sorted by path.
+// ---------------------------------------------------------------------
+// git plumbing (fixture/vcs) — the repo IS the fixture; git's answers
+// ARE the expectations.
+// ---------------------------------------------------------------------
+
+fn git_text(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+fn git_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+/// `git ls-tree -r -t <ref>` → [{id, type, path}] — real git ids, so
+/// blob entries agree with `repo/blob_at`'s content ids exactly.
+fn git_ls_tree(dir: &Path, refspec: &str) -> Option<Vec<Value>> {
+    let out = git_text(dir, &["ls-tree", "-r", "-t", refspec])?;
+    let entries = out
+        .lines()
+        .filter_map(|l| {
+            let (meta, path) = l.split_once('\t')?;
+            let mut fields = meta.split_whitespace();
+            let _mode = fields.next()?;
+            let kind = fields.next()?.to_string();
+            let id = fields.next()?.to_string();
+            Some(json!({ "id": id, "type": kind, "path": path }))
+        })
+        .collect();
+    Some(entries)
+}
+
+/// Raw bytes of `path` at `ref_name` (worktree for plain dirs).
+fn raw_file_at(r: &Repo, path: &str, ref_name: &str) -> Option<Vec<u8>> {
+    if r.is_git {
+        git_bytes(&r.dir, &["show", &format!("{ref_name}:{path}")])
+    } else {
+        std::fs::read(r.dir.join(path)).ok()
+    }
+}
+
+/// `git blame --porcelain` → GitLab chunk shape. Adjacent same-sha
+/// chunks merge (the adapter coalesces too, but pre-merged is tidy);
+/// author + author-date come from the commit itself (`%an` / `%aI`,
+/// the instant FC-098 compares against).
+fn blame(r: &Repo, path: &str, ref_name: &str) -> Option<Vec<Value>> {
+    if !r.is_git {
+        return None;
+    }
+    let out = git_text(&r.dir, &["blame", "--porcelain", ref_name, "--", path])?;
+    let mut chunks: Vec<(String, Vec<String>)> = Vec::new();
+    for line in out.lines() {
+        if let Some(content) = line.strip_prefix('\t') {
+            if let Some((_, lines)) = chunks.last_mut() {
+                lines.push(content.to_string());
+            }
+        } else if let Some(header) = parse_blame_header(line) {
+            let sha = header;
+            match chunks.last_mut() {
+                Some((prev, _)) if *prev == sha => {}
+                _ => chunks.push((sha, Vec::new())),
+            }
+        }
+    }
+    let mut result = Vec::new();
+    for (sha, lines) in chunks {
+        if lines.is_empty() {
+            continue;
+        }
+        let meta = git_text(&r.dir, &["show", "-s", "--format=%an%n%aI", &sha]).unwrap_or_default();
+        let mut meta_lines = meta.lines();
+        let author = meta_lines.next().unwrap_or_default().to_string();
+        let date = meta_lines.next().unwrap_or_default().to_string();
+        result.push(json!({
+            "commit": {
+                "id": sha,
+                "author_name": author,
+                "committed_date": date,
+            },
+            "lines": lines,
+        }));
+    }
+    Some(result)
+}
+
+/// A porcelain header line: `<40-hex> <orig> <final> [<count>]`
+/// (boundary commits carry a `^` prefix — stripped; the commit is the
+/// same). Metadata lines don't match and are skipped by the caller.
+fn parse_blame_header(line: &str) -> Option<String> {
+    let body = line.strip_prefix('^').unwrap_or(line);
+    let mut fields = body.split_whitespace();
+    let sha = fields.next()?;
+    let is_sha = sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit());
+    let rest: Vec<_> = fields.collect();
+    let shape = rest.len() == 2 || rest.len() == 3;
+    if is_sha && shape {
+        Some(sha.to_string())
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------
+// Filesystem fixture serving (alpha/beta) — fresh from disk per
+// request, content-keyed ids.
+// ---------------------------------------------------------------------
+
+/// Every file under `dir` as (repo-relative path, bytes), sorted by
+/// path. `.git` is never content.
 fn files_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -404,6 +742,9 @@ fn files_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
             .collect();
         names.sort();
         for (name, path, is_dir) in names {
+            if name == ".git" {
+                continue;
+            }
             let rel = if prefix.is_empty() {
                 name.clone()
             } else {
@@ -423,9 +764,7 @@ fn files_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// Recursive tree walk: blobs carry their git-style blob sha1, trees a
 /// sha1 over their sorted children — ids change exactly when content
-/// changes. Returns the root tree id (the branch head is derived from
-/// it, so any mutation moves the head and busts the adapter's
-/// content-keyed cache precisely).
+/// changes. Returns the root tree id.
 fn walk_tree(dir: &Path, prefix: &str, out: &mut Vec<Value>) -> String {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return String::new();
@@ -444,6 +783,9 @@ fn walk_tree(dir: &Path, prefix: &str, out: &mut Vec<Value>) -> String {
     names.sort();
     let mut lines = Vec::new();
     for (name, path, is_dir) in names {
+        if name == ".git" {
+            continue;
+        }
         let rel = if prefix.is_empty() {
             name.clone()
         } else {
@@ -454,18 +796,20 @@ fn walk_tree(dir: &Path, prefix: &str, out: &mut Vec<Value>) -> String {
             out.push(json!({ "id": child, "type": "tree", "path": rel }));
             lines.push(format!("tree {name} {child}"));
         } else {
-            let id = git_blob_id(&std::fs::read(&path).unwrap_or_default());
+            let id = git_blob_sha(&std::fs::read(&path).unwrap_or_default());
             out.push(json!({ "id": id, "type": "blob", "path": rel }));
             lines.push(format!("blob {name} {id}"));
         }
     }
-    hex(&sha1(format!("tree\n{}\n", lines.join("\n")).as_bytes()))
+    let mut hasher = Sha1::new();
+    hasher.update(format!("tree\n{}\n", lines.join("\n")));
+    format!("{:x}", hasher.finalize())
 }
 
 fn blob_by_sha(dir: &Path, sha: &str) -> Option<Vec<u8>> {
     files_under(dir)
         .into_iter()
-        .find(|(_, bytes)| git_blob_id(bytes) == sha)
+        .find(|(_, bytes)| git_blob_sha(bytes) == sha)
         .map(|(_, bytes)| bytes)
 }
 
@@ -487,78 +831,4 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-// ---------------------------------------------------------------------
-// Content ids: git-style blob sha1 ("blob <len>\0<bytes>") — the
-// scheme gitlab itself uses, deterministic across processes.
-// ---------------------------------------------------------------------
-
-fn git_blob_id(data: &[u8]) -> String {
-    let mut buf = format!("blob {}\0", data.len()).into_bytes();
-    buf.extend_from_slice(data);
-    hex(&sha1(&buf))
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// SHA-1 (FIPS 180-1) — stdlib-only, verified against hashlib.
-fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [
-        0x6745_2301,
-        0xEFCD_AB89,
-        0x98BA_DCFE,
-        0x1032_5476,
-        0xC3D2_E1F0,
-    ];
-    let bitlen = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bitlen.to_be_bytes());
-    for c in 0..msg.len() / 64 {
-        let chunk = &msg[c * 64..c * 64 + 64];
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            let b = &chunk[i * 4..i * 4 + 4];
-            w[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | (!b & d), 0x5A82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
-                _ => (b ^ c ^ d, 0xCA62_C1D6),
-            };
-            let tmp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = tmp;
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-    }
-    let mut out = [0u8; 20];
-    for (i, v) in h.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
 }
