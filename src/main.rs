@@ -1,8 +1,11 @@
 //! Argument parsing plus the stdin loop (in `rootle_gitlab::serve_stdio`):
-//! read a line, dispatch, write the reply lines (v1.3 progressive
-//! results may interleave `$/partial` notifications), flush per line.
-//! Nothing else — rootle owns this process's lifecycle and may respawn
-//! it at any time (initialize runs once per generation, cheaply).
+//! read lines on this thread, dispatch each request on its own worker
+//! thread, write the reply lines through a shared line-atomic stdout
+//! writer (v1.3 progressive results may interleave `/$partial`
+//! notifications between requests — every line is id-tagged), flush
+//! per line. Nothing else — rootle owns this process's lifecycle and
+//! may respawn it at any time (initialize runs once per generation,
+//! cheaply).
 
 use rootle_gitlab::{Handler, api, serve_stdio};
 
