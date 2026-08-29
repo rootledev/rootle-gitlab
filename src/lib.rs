@@ -182,8 +182,7 @@ mod tests {
         // reqwest::blocking may neither be created nor dropped on a
         // tokio worker (testkit rule): the whole serve loop, handler
         // included, runs on a plain scoped thread.
-        let sink: Arc<parking_lot::Mutex<Vec<u8>>> =
-            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
         {
             let sink = Arc::clone(&sink);
             std::thread::scope(|s| {
