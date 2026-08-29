@@ -21,6 +21,14 @@ use crate::api::{ApiError, ApiResult, GitLab};
 use crate::cache::Cache;
 use serde_json::{Value, json};
 
+/// The adapter: one instance shared by every request the serve loop
+/// has in flight (v1.3 concurrency audit): the GitLab client is
+/// read-only config plus a `Sync` reqwest client and a `OnceLock`
+/// token (a first-read race is benign — same env var, one winner);
+/// the cache is disk-backed (the `RwLock` exists only for
+/// `initialize`'s idempotent re-rooting, and every disk write is
+/// tmp+rename atomic). No per-request state lives here, so `&self`
+/// sharing across worker threads is safe without further guards.
 pub struct Handler {
     pub gl: GitLab,
     /// Rooted at the handshake's cache_dir when rootle passes one
